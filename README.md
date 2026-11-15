@@ -64,6 +64,21 @@ Filter                    | Resize result
 `imaging.CatmullRom`      | ![dstImage](testdata/out_resize_catrom.png)
 `imaging.Lanczos`         | ![dstImage](testdata/out_resize_lanczos.png)
 
+### Content-aware resizing (seam carving)
+
+```go
+// Shrink srcImage from 800x600 to 600x500 by removing low-energy seams
+// instead of rescaling, protecting the areas marked in maskImage.
+dstImage, err := imaging.SeamCarve(srcImage, 600, 500, maskImage)
+```
+
+`SeamCarve` reduces the width and/or height of an image by repeatedly removing
+the least noticeable pixel path (seam), so the important content is preserved
+without distortion and without cropping away the edges. An optional mask image
+(same size as the source, non-zero alpha marks protected pixels) keeps important
+areas — such as the main subject — untouched. A zero width or height keeps the
+corresponding dimension. Enlarging is not supported.
+
 
 ### Gaussian Blur
 
