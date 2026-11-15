@@ -139,6 +139,43 @@ Original image                     | Hue = 60                                   
 -----------------------------------|----------------------------------------------|---------------------------------------------
 ![srcImage](testdata/flowers_small.png) | ![dstImage](testdata/out_hue_p60.png) | ![dstImage](testdata/out_hue_m60.png)
 
+### Sprite atlas
+
+`Atlas` packs named images into a single texture. Transparent borders can be
+trimmed, frames are separated by configurable padding, and edge pixels can be
+extruded to avoid color bleeding under linear filtering. Each frame reports its
+original size, the trimmed bounds and the atlas position, so frames can be
+restored to their original coordinates. The layout is deterministic and the
+function returns an error instead of a partial atlas when the frames do not fit
+or an input is invalid (duplicate or empty name, nil/empty image, fully
+transparent frame while trimming is enabled).
+
+```go
+frames := []imaging.NamedImage{
+    {Name: "idle", Image: idleImage},
+    {Name: "run", Image: runImage},
+    {Name: "attack", Image: attackImage},
+}
+
+atlas, metadata, err := imaging.Atlas(frames, imaging.AtlasOptions{
+    MaxWidth:  1024,
+    MaxHeight: 1024,
+    Padding:   2,
+    Extrude:   1,
+    Trim:      true,
+})
+if err != nil {
+    // handle the error: no partial atlas or metadata is returned
+}
+
+for _, frame := range metadata {
+    // frame.Frame  - original frame rectangle (original size and position)
+    // frame.Bounds - non-transparent bounds inside the original image
+    // frame.Atlas  - content rectangle inside the atlas image
+    _ = frame
+}
+```
+
 ## FAQ
 
 ### Incorrect image orientation after processing (e.g. an image appears rotated after resizing)
