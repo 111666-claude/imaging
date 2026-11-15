@@ -139,6 +139,34 @@ Original image                     | Hue = 60                                   
 -----------------------------------|----------------------------------------------|---------------------------------------------
 ![srcImage](testdata/flowers_small.png) | ![dstImage](testdata/out_hue_p60.png) | ![dstImage](testdata/out_hue_m60.png)
 
+### Animated GIFs
+
+Use `OpenGIF`/`DecodeGIF` to load an animated GIF with all frames, per-frame
+delays and the loop count intact, `ResizeGIF` to scale the whole animation to
+a new size, and `SaveGIF`/`EncodeGIF` to write the result as a playable
+animation:
+
+```go
+src, err := imaging.OpenGIF("animation.gif")
+if err != nil {
+    log.Fatalf("failed to open GIF: %v", err)
+}
+
+dst, err := imaging.ResizeGIF(src, 128, 128, imaging.Lanczos)
+if err != nil {
+    log.Fatalf("failed to resize GIF: %v", err)
+}
+
+err = imaging.SaveGIF(dst, "animation_small.gif")
+if err != nil {
+    log.Fatalf("failed to save GIF: %v", err)
+}
+```
+
+Partial frames, transparent pixels and background/previous disposal methods
+are composited before scaling, so the visible picture of every frame is
+preserved. Frame order, per-frame delays and the loop count are kept as-is.
+
 ## FAQ
 
 ### Incorrect image orientation after processing (e.g. an image appears rotated after resizing)
