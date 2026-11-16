@@ -139,6 +139,30 @@ Original image                     | Hue = 60                                   
 -----------------------------------|----------------------------------------------|---------------------------------------------
 ![srcImage](testdata/flowers_small.png) | ![dstImage](testdata/out_hue_p60.png) | ![dstImage](testdata/out_hue_m60.png)
 
+### Adaptive palette for GIF encoding
+
+`PaletteQuantizer` builds a palette from the colors actually present in the
+image, so a GIF can be exported with a limited number of colors without losing
+the dominant ones. It implements `draw.Quantizer` and can be passed directly to
+`GIFQuantizer` (or to `gif.Options.Quantizer`).
+
+```go
+// Encode a pixel-art texture as a GIF using at most 16 colors.
+err := imaging.Save(srcImage, "texture.gif",
+    imaging.GIFNumColors(16),
+    imaging.GIFQuantizer(imaging.NewPaletteQuantizer(16)),
+)
+```
+
+The quantizer is deterministic: the same image always produces the same colors
+in the same order, regardless of the image's `Bounds` origin or its concrete
+`image.Image` type. Transparent pixels are excluded from the color statistics
+and a dedicated transparent entry is reserved as the first palette color, so
+transparent areas stay transparent in the GIF. When the image already contains
+fewer colors than the budget, every color is kept verbatim and no duplicate
+palette entries are produced. `AdaptivePalette(img, n)` returns the resulting
+`color.Palette` when the palette itself is needed.
+
 ## FAQ
 
 ### Incorrect image orientation after processing (e.g. an image appears rotated after resizing)
