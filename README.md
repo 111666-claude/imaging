@@ -36,6 +36,14 @@ dstImageFit := imaging.Fit(srcImage, 800, 600, imaging.Lanczos)
 
 // Resize and crop the srcImage to fill the 100x100px area.
 dstImageFill := imaging.Fill(srcImage, 100, 100, imaging.Center, imaging.Lanczos)
+
+// Resize and crop around the most salient part of the image (e.g. a subject
+// that is not in the center of a cover photo).
+dstImageSmart := imaging.SmartThumbnail(srcImage, 100, 100, imaging.Lanczos)
+
+// Determine the crop window without resampling, e.g. to reuse it for a
+// lossless crop of the original file.
+cropRect := imaging.SmartCropRect(srcImage, 100, 100)
 ```
 
 Imaging supports image resizing using various resampling filters. The most notable ones:
@@ -47,6 +55,17 @@ Imaging supports image resizing using various resampling filters. The most notab
 - `NearestNeighbor` - Fastest resampling filter, no antialiasing.
 
 The full list of supported filters:  NearestNeighbor, Box, Linear, Hermite, MitchellNetravali, CatmullRom, BSpline, Gaussian, Lanczos, Hann, Hamming, Blackman, Bartlett, Welch, Cosine. Custom filters can be created using ResampleFilter struct.
+
+**Smart thumbnails**
+
+`imaging.Thumbnail` and `imaging.Fill` always crop around the center (or a
+fixed anchor), which cuts subjects that are not in the middle of the frame.
+`imaging.SmartThumbnail` instead scores candidate crop windows by edge and
+local contrast (saliency), picks the highest-scoring window with the requested
+aspect ratio and then resamples it with the given filter. Transparent regions
+are weighted down, non-zero image bounds are supported and uniform images fall
+back to a centered crop. `imaging.SmartCropRect` returns the chosen window
+without doing any resampling.
 
 **Resampling filters comparison**
 
