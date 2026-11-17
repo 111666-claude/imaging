@@ -65,6 +65,40 @@ Filter                    | Resize result
 `imaging.Lanczos`         | ![dstImage](testdata/out_resize_lanczos.png)
 
 
+### Texture mipmaps
+
+```go
+// Build a complete chain of half-size levels, down to 1x1, ready to be
+// uploaded as texture mip levels.
+levels, err := imaging.GenerateMipmaps(srcImage, imaging.MipmapOptions{
+    LinearLight: true,
+})
+if err != nil {
+    // empty, oversized or overflowing image
+}
+
+// levels[0] is the base image, levels[1] is half size, and so on.
+for _, mip := range levels {
+    _ = mip.Pix
+}
+```
+
+`GenerateMipmaps` returns levels in decreasing size order, each a zero-origin
+`*image.NRGBA` whose dimensions are `max(1, width/2)` by `max(1, height/2)` of
+the previous level, matching the mip level sizes used by graphics APIs. Odd
+dimensions are handled without dropping the last row/column, and the chain
+always reaches 1x1.
+
+Levels are filtered with area-weighted box sampling on premultiplied alpha, so
+fully transparent pixels cannot bleed dark colors into semi-transparent edges
+(the black fringes that appear when a cut-out texture is minified). With
+`LinearLight` the color channels are averaged in linear RGB and encoded back to
+sRGB, avoiding the darkening of high-contrast details; level 0 remains an exact
+copy. `MaxLevels` truncates the chain and `MaxPixels` bounds the total number
+of pixels across all levels; invalid or oversized requests return a documented
+error instead of an allocation.
+
+
 ### Gaussian Blur
 
 ```go
