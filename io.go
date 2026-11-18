@@ -159,6 +159,8 @@ type encodeConfig struct {
 	gifNumColors        int
 	gifQuantizer        draw.Quantizer
 	gifDrawer           draw.Drawer
+	gifLoopCount        int
+	gifDisposal         byte
 	pngCompressionLevel png.CompressionLevel
 }
 
@@ -167,6 +169,8 @@ var defaultEncodeConfig = encodeConfig{
 	gifNumColors:        256,
 	gifQuantizer:        nil,
 	gifDrawer:           nil,
+	gifLoopCount:        0,
+	gifDisposal:         GIFDisposalNone,
 	pngCompressionLevel: png.DefaultCompression,
 }
 
