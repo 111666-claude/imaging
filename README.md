@@ -64,6 +64,41 @@ Filter                    | Resize result
 `imaging.CatmullRom`      | ![dstImage](testdata/out_resize_catrom.png)
 `imaging.Lanczos`         | ![dstImage](testdata/out_resize_lanczos.png)
 
+### Linear light resizing
+
+By default the resampling filters average the sRGB-encoded values stored in
+the image, which matches the historical behavior but darkens high-contrast
+details. Averaging an equal mix of black and white, for example, produces
+sRGB 128 instead of the physically correct 188, so a black and white UI
+texture looks muddy after it is scaled down.
+
+Pass `imaging.LinearLight(true)` (or use `imaging.ResizeLinear`) to convert
+the sRGB values to linear light, filter them there with premultiplied alpha
+and encode the result back to sRGB:
+
+```go
+// Filter in linear light.
+dst := imaging.Resize(src, 800, 0, imaging.Lanczos, imaging.LinearLight(true))
+
+// Equivalent, dedicated helpers exist for the other scaling functions.
+dst = imaging.ResizeLinear(src, 800, 0, imaging.Lanczos)
+dst = imaging.FitLinear(src, 800, 600, imaging.Lanczos)
+dst = imaging.FillLinear(src, 800, 600, imaging.Center, imaging.Lanczos)
+dst = imaging.ThumbnailLinear(src, 100, 100, imaging.Lanczos)
+```
+
+The option is also accepted by `Fit`, `Fill` and `Thumbnail`. The default
+(`LinearLight(false)`) keeps the existing results of all of them unchanged.
+Premultiplied alpha and the linear-light conversion are always used together
+in linear mode, so fully transparent pixels cannot bleed their color into
+visible ones and transparent edges do not get dark fringes. `NearestNeighbor`
+does not mix pixels and is unaffected.
+
+Linear light filtering works on floating point intermediate values and is
+roughly 1.5x slower and needs more memory than the default path. A result or
+intermediate buffer above `imaging.DefaultResizeLinearMaxPixels` pixels is
+rejected and returns an empty image instead of allocating, as is an upscale
+whose weight table would exceed `imaging.DefaultResizeLinearMaxWeightBytes`.
 
 ### Gaussian Blur
 

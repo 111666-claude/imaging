@@ -58,11 +58,16 @@ func precomputeWeights(dstSize, srcSize int, filter ResampleFilter) [][]indexWei
 // filter and returns the transformed image. If one of width or height is 0, the image aspect
 // ratio is preserved.
 //
+// By default the resampling is done on the sRGB-encoded values stored in the image.
+// Pass LinearLight(true) to filter in linear light instead, which keeps high-contrast
+// details (e.g. black and white UI textures) from darkening when scaled down.
+//
 // Example:
 //
 //	dstImage := imaging.Resize(srcImage, 800, 600, imaging.Lanczos)
-//
-func Resize(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA {
+//	dstImage = imaging.Resize(srcImage, 800, 600, imaging.Lanczos, imaging.LinearLight(true))
+func Resize(img image.Image, width, height int, filter ResampleFilter, opts ...ResizeOption) *image.NRGBA {
+	cfg := newResizeConfig(opts)
 	dstW, dstH := width, height
 	if dstW < 0 || dstH < 0 {
 		return &image.NRGBA{}
@@ -94,6 +99,10 @@ func Resize(img image.Image, width, height int, filter ResampleFilter) *image.NR
 	if filter.Support <= 0 {
 		// Nearest-neighbor special case.
 		return resizeNearest(img, dstW, dstH)
+	}
+
+	if cfg.linearLight {
+		return resizeLinear(img, dstW, dstH, filter)
 	}
 
 	if srcW != dstW && srcH != dstH {
@@ -217,11 +226,12 @@ func resizeNearest(img image.Image, width, height int) *image.NRGBA {
 // Fit scales down the image using the specified resample filter to fit the specified
 // maximum width and height and returns the transformed image.
 //
+// Pass LinearLight(true) to resample in linear light; see Resize for details.
+//
 // Example:
 //
 //	dstImage := imaging.Fit(srcImage, 800, 600, imaging.Lanczos)
-//
-func Fit(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA {
+func Fit(img image.Image, width, height int, filter ResampleFilter, opts ...ResizeOption) *image.NRGBA {
 	maxW, maxH := width, height
 
 	if maxW <= 0 || maxH <= 0 {
@@ -252,17 +262,18 @@ func Fit(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA
 		newW = int(float64(newH) * srcAspectRatio)
 	}
 
-	return Resize(img, newW, newH, filter)
+	return Resize(img, newW, newH, filter, opts...)
 }
 
 // Fill creates an image with the specified dimensions and fills it with the scaled source image.
 // To achieve the correct aspect ratio without stretching, the source image will be cropped.
 //
+// Pass LinearLight(true) to resample in linear light; see Resize for details.
+//
 // Example:
 //
 //	dstImage := imaging.Fill(srcImage, 800, 600, imaging.Center, imaging.Lanczos)
-//
-func Fill(img image.Image, width, height int, anchor Anchor, filter ResampleFilter) *image.NRGBA {
+func Fill(img image.Image, width, height int, anchor Anchor, filter ResampleFilter, opts ...ResizeOption) *image.NRGBA {
 	dstW, dstH := width, height
 
 	if dstW <= 0 || dstH <= 0 {
@@ -282,16 +293,16 @@ func Fill(img image.Image, width, height int, anchor Anchor, filter ResampleFilt
 	}
 
 	if srcW >= 100 && srcH >= 100 {
-		return cropAndResize(img, dstW, dstH, anchor, filter)
+		return cropAndResize(img, dstW, dstH, anchor, filter, opts...)
 	}
-	return resizeAndCrop(img, dstW, dstH, anchor, filter)
+	return resizeAndCrop(img, dstW, dstH, anchor, filter, opts...)
 }
 
 // cropAndResize crops the image to the smallest possible size that has the required aspect ratio using
 // the given anchor point, then scales it to the specified dimensions and returns the transformed image.
 //
 // This is generally faster than resizing first, but may result in inaccuracies when used on small source images.
-func cropAndResize(img image.Image, width, height int, anchor Anchor, filter ResampleFilter) *image.NRGBA {
+func cropAndResize(img image.Image, width, height int, anchor Anchor, filter ResampleFilter, opts ...ResizeOption) *image.NRGBA {
 	dstW, dstH := width, height
 
 	srcBounds := img.Bounds()
@@ -309,13 +320,13 @@ func cropAndResize(img image.Image, width, height int, anchor Anchor, filter Res
 		tmp = CropAnchor(img, int(math.Max(1, cropW)+0.5), srcH, anchor)
 	}
 
-	return Resize(tmp, dstW, dstH, filter)
+	return Resize(tmp, dstW, dstH, filter, opts...)
 }
 
 // resizeAndCrop resizes the image to the smallest possible size that will cover the specified dimensions,
 // crops the resized image to the specified dimensions using the given anchor point and returns
 // the transformed image.
-func resizeAndCrop(img image.Image, width, height int, anchor Anchor, filter ResampleFilter) *image.NRGBA {
+func resizeAndCrop(img image.Image, width, height int, anchor Anchor, filter ResampleFilter, opts ...ResizeOption) *image.NRGBA {
 	dstW, dstH := width, height
 
 	srcBounds := img.Bounds()
@@ -326,9 +337,9 @@ func resizeAndCrop(img image.Image, width, height int, anchor Anchor, filter Res
 
 	var tmp *image.NRGBA
 	if srcAspectRatio < dstAspectRatio {
-		tmp = Resize(img, dstW, 0, filter)
+		tmp = Resize(img, dstW, 0, filter, opts...)
 	} else {
-		tmp = Resize(img, 0, dstH, filter)
+		tmp = Resize(img, 0, dstH, filter, opts...)
 	}
 
 	return CropAnchor(tmp, dstW, dstH, anchor)
@@ -337,12 +348,13 @@ func resizeAndCrop(img image.Image, width, height int, anchor Anchor, filter Res
 // Thumbnail scales the image up or down using the specified resample filter, crops it
 // to the specified width and hight and returns the transformed image.
 //
+// Pass LinearLight(true) to resample in linear light; see Resize for details.
+//
 // Example:
 //
 //	dstImage := imaging.Thumbnail(srcImage, 100, 100, imaging.Lanczos)
-//
-func Thumbnail(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA {
-	return Fill(img, width, height, Center, filter)
+func Thumbnail(img image.Image, width, height int, filter ResampleFilter, opts ...ResizeOption) *image.NRGBA {
+	return Fill(img, width, height, Center, filter, opts...)
 }
 
 // ResampleFilter specifies a resampling filter to be used for image resizing.
