@@ -213,12 +213,38 @@ func PNGCompressionLevel(level png.CompressionLevel) EncodeOption {
 	}
 }
 
+// shortWriteDetector normalizes a misbehaving io.Writer. The io.Writer
+// contract requires a non-nil error whenever n < len(p), but some image
+// encoders only inspect the error and ignore the byte count. Wrapping the
+// destination here guarantees that truncated output is never reported as a
+// successful encode, for every format.
+type shortWriteDetector struct {
+	w io.Writer
+}
+
+func (d shortWriteDetector) Write(p []byte) (int, error) {
+	n, err := d.w.Write(p)
+	if n < 0 || n > len(p) {
+		return 0, io.ErrShortWrite
+	}
+	if err == nil && n < len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+// ErrImageTooLarge means the image dimensions do not fit in the target
+// format's header fields.
+var ErrImageTooLarge = errors.New("imaging: image is too large to encode")
+
 // Encode writes the image img to w in the specified format (JPEG, PNG, GIF, TIFF or BMP).
 func Encode(w io.Writer, img image.Image, format Format, opts ...EncodeOption) error {
 	cfg := defaultEncodeConfig
 	for _, option := range opts {
 		option(&cfg)
 	}
+
+	w = shortWriteDetector{w}
 
 	switch format {
 	case JPEG:
@@ -244,6 +270,14 @@ func Encode(w io.Writer, img image.Image, format Format, opts ...EncodeOption) e
 		})
 
 	case TIFF:
+		// golang.org/x/image/tiff stores ImageWidth/ImageLength as 16-bit
+		// SHORT tags and silently truncates larger values, producing a file
+		// whose header disagrees with its pixel data. Reject such images
+		// instead of emitting a corrupt file.
+		b := img.Bounds()
+		if b.Dx() > 0xffff || b.Dy() > 0xffff {
+			return ErrImageTooLarge
+		}
 		return tiff.Encode(w, img, &tiff.Options{Compression: tiff.Deflate, Predictor: true})
 
 	case BMP:
