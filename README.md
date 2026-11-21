@@ -48,6 +48,23 @@ Imaging supports image resizing using various resampling filters. The most notab
 
 The full list of supported filters:  NearestNeighbor, Box, Linear, Hermite, MitchellNetravali, CatmullRom, BSpline, Gaussian, Lanczos, Hann, Hamming, Blackman, Bartlett, Welch, Cosine. Custom filters can be created using ResampleFilter struct.
 
+#### Alpha coverage preserving resize
+
+When an image with an alpha cutout (for example a tree or foliage texture that has been trimmed against an alpha threshold) is downscaled, resampling can push the alpha of thin or sparse pixels below the cutout threshold and large areas can disappear at a distance.
+
+`ResizeCoverage`, `FitCoverage` and `ThumbnailCoverage` work like `Resize`, `Fit` and `Thumbnail`, but measure the fraction of source pixels above an alpha threshold and adjust the alpha channel of the resized image to keep that fraction as constant as possible. The output dimensions and the RGB channel values are unchanged; only the alpha channel is scaled.
+
+```go
+// Resize while keeping the fraction of pixels with alpha >= 128 constant.
+dstImage := imaging.ResizeCoverage(srcImage, 128, 128, imaging.Lanczos, 128)
+
+// Coverage-preserving fit and thumbnail share the same entry points.
+dstFit := imaging.FitCoverage(srcImage, 800, 600, imaging.Lanczos, 128)
+dstThumb := imaging.ThumbnailCoverage(srcImage, 100, 100, imaging.Lanczos, 128)
+```
+
+A threshold of 0 or a value outside the `[1, 255]` range disables the adjustment, in which case these functions return exactly what their plain counterparts produce.
+
 **Resampling filters comparison**
 
 Original image:
