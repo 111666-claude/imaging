@@ -154,6 +154,28 @@ orientation tag (if present). Here's the example:
 img, err := imaging.Open("test.jpg", imaging.AutoOrientation(true))
 ```
 
+### Limiting resources used while decoding untrusted images
+
+A small crafted file can declare huge image dimensions and make the decoder
+allocate gigabytes of memory. To guard against such decompression bombs,
+`Open` and `Decode` accept optional safety budgets. The limits are enforced
+before pixel data is allocated whenever the dimensions can be determined from
+the image header, and they work with any `io.Reader` (including non-seekable
+streams) as well as together with `AutoOrientation`:
+
+```go
+img, err := imaging.Open("upload.png",
+	imaging.MaxInputBytes(10<<20), // reject inputs larger than 10MB
+	imaging.MaxPixels(16<<20),     // reject images with more than 16M pixels
+	imaging.MaxDimension(8192),    // reject images wider/taller than 8192px
+)
+```
+
+Over-budget inputs fail with `imaging.ErrInputTooLarge` or
+`imaging.ErrImageTooLarge` (use `errors.Is` to check), truncated files with
+`io.ErrUnexpectedEOF` and unsupported formats with `image.ErrFormat`. All
+limits are disabled by default.
+
 ### What's the difference between `imaging` and `gift` packages?
 
 [imaging](https://github.com/disintegration/imaging)

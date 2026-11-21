@@ -1,8 +1,10 @@
 package imaging
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/draw"
 	"image/gif"
@@ -32,6 +34,9 @@ var fs fileSystem = localFS{}
 
 type decodeConfig struct {
 	autoOrientation bool
+	maxInputBytes   int64
+	maxPixels       int64
+	maxDimension    int
 }
 
 var defaultDecodeConfig = decodeConfig{
@@ -50,11 +55,106 @@ func AutoOrientation(enabled bool) DecodeOption {
 	}
 }
 
+// MaxInputBytes returns a DecodeOption that limits the number of bytes
+// consumed from the input. If the limit is exceeded, Decode and Open fail
+// with ErrInputTooLarge. A zero or negative value means no limit (default).
+func MaxInputBytes(n int64) DecodeOption {
+	return func(c *decodeConfig) {
+		c.maxInputBytes = n
+	}
+}
+
+// MaxPixels returns a DecodeOption that limits the total number of pixels
+// (width*height) of the decoded image. The limit is enforced before pixel
+// data is allocated whenever the image dimensions can be determined from the
+// header. If the limit is exceeded, Decode and Open fail with
+// ErrImageTooLarge. A zero or negative value means no limit (default).
+func MaxPixels(n int) DecodeOption {
+	return func(c *decodeConfig) {
+		c.maxPixels = int64(n)
+	}
+}
+
+// MaxDimension returns a DecodeOption that limits the width and height of
+// the decoded image: neither side may exceed the given value. The limit is
+// enforced before pixel data is allocated whenever the image dimensions can
+// be determined from the header. If the limit is exceeded, Decode and Open
+// fail with ErrImageTooLarge. A zero or negative value means no limit
+// (default).
+func MaxDimension(n int) DecodeOption {
+	return func(c *decodeConfig) {
+		c.maxDimension = n
+	}
+}
+
+// ErrInputTooLarge means the input data exceeds the limit set by MaxInputBytes.
+var ErrInputTooLarge = errors.New("imaging: input data exceeds the size limit")
+
+// ErrImageTooLarge means the decoded image dimensions exceed the limits set
+// by MaxPixels or MaxDimension.
+var ErrImageTooLarge = errors.New("imaging: image dimensions exceed the limit")
+
+// limitErrorReader reads at most n+1 bytes from r. Once more than n bytes
+// have been consumed it reports ErrInputTooLarge instead of io.EOF, so that
+// an over-limit input is distinguishable from a truncated one.
+type limitErrorReader struct {
+	r       io.Reader
+	n       int64 // remaining allowed bytes, plus one
+	exceeds bool
+}
+
+func (l *limitErrorReader) Read(p []byte) (int, error) {
+	if l.exceeds {
+		return 0, ErrInputTooLarge
+	}
+	if l.n <= 0 {
+		l.exceeds = true
+		return 0, ErrInputTooLarge
+	}
+	if int64(len(p)) > l.n {
+		p = p[:l.n]
+	}
+	n, err := l.r.Read(p)
+	l.n -= int64(n)
+	if l.n <= 0 && err == nil {
+		// The whole allowance (limit+1 bytes) was consumed: the input is
+		// larger than the limit.
+		l.exceeds = true
+	}
+	return n, err
+}
+
+// checkDimensions verifies the given image dimensions against the limits.
+// The pixel count is computed in 64-bit arithmetic so that maliciously large
+// declared dimensions cannot overflow it.
+func checkDimensions(width, height int, cfg *decodeConfig) error {
+	if cfg.maxDimension > 0 && (width > cfg.maxDimension || height > cfg.maxDimension) {
+		return fmt.Errorf("%w: %dx%d exceeds the maximum side length of %d",
+			ErrImageTooLarge, width, height, cfg.maxDimension)
+	}
+	if cfg.maxPixels > 0 && width > 0 && height > 0 {
+		if int64(width)*int64(height) > cfg.maxPixels {
+			return fmt.Errorf("%w: %dx%d exceeds the maximum of %d pixels",
+				ErrImageTooLarge, width, height, cfg.maxPixels)
+		}
+	}
+	return nil
+}
+
+// hasLimits reports whether any of the safety budget limits are set.
+func (c *decodeConfig) hasLimits() bool {
+	return c.maxInputBytes > 0 || c.maxPixels > 0 || c.maxDimension > 0
+}
+
 // Decode reads an image from r.
 func Decode(r io.Reader, opts ...DecodeOption) (image.Image, error) {
 	cfg := defaultDecodeConfig
 	for _, option := range opts {
 		option(&cfg)
+	}
+
+	if cfg.hasLimits() {
+		return decodeWithLimits(r, &cfg)
 	}
 
 	if !cfg.autoOrientation {
@@ -82,6 +182,72 @@ func Decode(r io.Reader, opts ...DecodeOption) (image.Image, error) {
 	return fixOrientation(img, orient), nil
 }
 
+// decodeWithLimits decodes an image from r enforcing the safety budget set in
+// cfg. It works with any io.Reader, including non-seekable streams: the image
+// header is sniffed through a tee into a small buffer, the declared dimensions
+// are checked before any pixel data is allocated, and the buffered prefix is
+// then replayed to the decoder. No background goroutines are started.
+func decodeWithLimits(r io.Reader, cfg *decodeConfig) (image.Image, error) {
+	var lr *limitErrorReader
+	if cfg.maxInputBytes > 0 {
+		lr = &limitErrorReader{r: r, n: cfg.maxInputBytes + 1}
+		r = lr
+	}
+
+	// Sniff the image configuration. Every byte the format decoder reads is
+	// copied into buf so the stream can be reassembled afterwards.
+	var buf bytes.Buffer
+	imgCfg, _, err := image.DecodeConfig(io.TeeReader(r, &buf))
+	if err != nil {
+		if lr != nil && lr.exceeds {
+			return nil, fmt.Errorf("%w: more than %d bytes", ErrInputTooLarge, cfg.maxInputBytes)
+		}
+		return nil, err
+	}
+
+	// The EXIF orientation (if any) is read from the buffered header prefix:
+	// for JPEG the APP1 marker always precedes the SOF marker that
+	// DecodeConfig stops at, so the prefix contains the whole EXIF block.
+	var orient orientation
+	if cfg.autoOrientation {
+		orient = readOrientation(bytes.NewReader(buf.Bytes()))
+	}
+
+	// Check the dimensions after the EXIF orientation is applied, so the
+	// limits match the image the caller will actually receive.
+	width, height := imgCfg.Width, imgCfg.Height
+	if orient == orientationRotate90 || orient == orientationRotate270 ||
+		orient == orientationTranspose || orient == orientationTransverse {
+		width, height = height, width
+	}
+	if err := checkDimensions(width, height, cfg); err != nil {
+		return nil, err
+	}
+
+	img, _, err := image.Decode(io.MultiReader(&buf, r))
+	if err != nil {
+		if lr != nil && lr.exceeds {
+			return nil, fmt.Errorf("%w: more than %d bytes", ErrInputTooLarge, cfg.maxInputBytes)
+		}
+		return nil, err
+	}
+	if lr != nil && lr.exceeds {
+		return nil, fmt.Errorf("%w: more than %d bytes", ErrInputTooLarge, cfg.maxInputBytes)
+	}
+
+	// Backstop: re-check the actual decoded bounds in case the declared
+	// dimensions did not match the decoded image.
+	b := img.Bounds()
+	if err := checkDimensions(b.Dx(), b.Dy(), cfg); err != nil {
+		return nil, err
+	}
+
+	if cfg.autoOrientation {
+		img = fixOrientation(img, orient)
+	}
+	return img, nil
+}
+
 // Open loads an image from file.
 //
 // Examples:
@@ -91,13 +257,32 @@ func Decode(r io.Reader, opts ...DecodeOption) (image.Image, error) {
 //
 //	// Load an image and transform it depending on the EXIF orientation tag (if present).
 //	img, err := imaging.Open("test.jpg", imaging.AutoOrientation(true))
-//
 func Open(filename string, opts ...DecodeOption) (image.Image, error) {
 	file, err := fs.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+
+	cfg := defaultDecodeConfig
+	for _, option := range opts {
+		option(&cfg)
+	}
+
+	// Reject oversize files up front when the file size is known, without
+	// reading a single byte.
+	if cfg.maxInputBytes > 0 {
+		if st, ok := file.(interface{ Stat() (os.FileInfo, error) }); ok {
+			if fi, err := st.Stat(); err == nil && fi.Size() > cfg.maxInputBytes {
+				return nil, fmt.Errorf("%w: file size %d exceeds the limit of %d bytes",
+					ErrInputTooLarge, fi.Size(), cfg.maxInputBytes)
+			}
+		}
+	}
+
+	if cfg.hasLimits() {
+		return decodeWithLimits(file, &cfg)
+	}
 	return Decode(file, opts...)
 }
 
@@ -264,7 +449,6 @@ func Encode(w io.Writer, img image.Image, format Format, opts ...EncodeOption) e
 //
 //	// Save the image as JPEG with optional quality parameter set to 80.
 //	err := imaging.Save(img, "out.jpg", imaging.JPEGQuality(80))
-//
 func Save(img image.Image, filename string, opts ...EncodeOption) (err error) {
 	f, err := FormatFromFilename(filename)
 	if err != nil {
