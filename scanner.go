@@ -5,31 +5,130 @@ import (
 	"image/color"
 )
 
+// scanFunc scans the rectangular region (x1, y1)-(x2, y2) of a source image
+// into dst as packed NRGBA pixels (4 bytes per pixel, row by row). The
+// coordinates are relative to the image bounds: (0, 0) is Bounds().Min.
+// dst must have a length of at least (x2-x1)*(y2-y1)*4.
+type scanFunc func(x1, y1, x2, y2 int, dst []uint8)
+
+// scanner reads pixels of an image in NRGBA format. The concrete scanning
+// strategy is selected once in newScanner, so scanning itself does no type
+// dispatch.
 type scanner struct {
-	image   image.Image
-	w, h    int
-	palette []color.NRGBA
+	w, h int
+	scan scanFunc
 }
 
 func newScanner(img image.Image) *scanner {
 	s := &scanner{
-		image: img,
-		w:     img.Bounds().Dx(),
-		h:     img.Bounds().Dy(),
+		w: img.Bounds().Dx(),
+		h: img.Bounds().Dy(),
 	}
-	if img, ok := img.(*image.Paletted); ok {
-		s.palette = make([]color.NRGBA, len(img.Palette))
-		for i := 0; i < len(img.Palette); i++ {
-			s.palette[i] = color.NRGBAModel.Convert(img.Palette[i]).(color.NRGBA)
-		}
+	switch img := img.(type) {
+	case *image.NRGBA:
+		s.scan = scanNRGBA(img)
+	case *image.NRGBA64:
+		s.scan = scanNRGBA64(img)
+	case *image.RGBA:
+		s.scan = scanRGBA(img)
+	case *image.RGBA64:
+		s.scan = scanRGBA64(img)
+	case *image.Gray:
+		s.scan = scanGray(img)
+	case *image.Gray16:
+		s.scan = scanGray16(img)
+	case *image.YCbCr:
+		s.scan = scanYCbCr(img)
+	case *image.Paletted:
+		s.scan = scanPaletted(img, paletteToNRGBA(img.Palette))
+	default:
+		s.scan = scanGeneric(img)
 	}
 	return s
 }
 
-// scan scans the given rectangular region of the image into dst.
-func (s *scanner) scan(x1, y1, x2, y2 int, dst []uint8) {
-	switch img := s.image.(type) {
-	case *image.NRGBA:
+// paletteToNRGBA converts a color palette to NRGBA once, so the paletted
+// scan path is a plain table lookup.
+func paletteToNRGBA(p color.Palette) []color.NRGBA {
+	palette := make([]color.NRGBA, len(p))
+	for i := 0; i < len(p); i++ {
+		palette[i] = color.NRGBAModel.Convert(p[i]).(color.NRGBA)
+	}
+	return palette
+}
+
+// unpremultiply8 converts an 8-bit alpha-premultiplied RGBA pixel s to NRGBA.
+func unpremultiply8(d, s []uint8) {
+	a := s[3]
+	switch a {
+	case 0:
+		d[0] = 0
+		d[1] = 0
+		d[2] = 0
+		d[3] = 0
+	case 0xff:
+		d[0] = s[0]
+		d[1] = s[1]
+		d[2] = s[2]
+		d[3] = 0xff
+	default:
+		a16 := uint16(a)
+		d[0] = uint8(uint16(s[0]) * 0xff / a16)
+		d[1] = uint8(uint16(s[1]) * 0xff / a16)
+		d[2] = uint8(uint16(s[2]) * 0xff / a16)
+		d[3] = a
+	}
+}
+
+// unpremultiply16 converts a 16-bit alpha-premultiplied RGBA pixel s
+// (big-endian, 2 bytes per channel) to 8-bit NRGBA.
+func unpremultiply16(d, s []uint8) {
+	a := s[6]
+	switch a {
+	case 0:
+		d[0] = 0
+		d[1] = 0
+		d[2] = 0
+	case 0xff:
+		d[0] = s[0]
+		d[1] = s[2]
+		d[2] = s[4]
+	default:
+		r32 := uint32(s[0])<<8 | uint32(s[1])
+		g32 := uint32(s[2])<<8 | uint32(s[3])
+		b32 := uint32(s[4])<<8 | uint32(s[5])
+		a32 := uint32(s[6])<<8 | uint32(s[7])
+		d[0] = uint8((r32 * 0xffff / a32) >> 8)
+		d[1] = uint8((g32 * 0xffff / a32) >> 8)
+		d[2] = uint8((b32 * 0xffff / a32) >> 8)
+	}
+	d[3] = a
+}
+
+// unpremultiply32 converts 16-bit-per-channel alpha-premultiplied RGBA
+// values (as returned by color.Color.RGBA) to 8-bit NRGBA.
+func unpremultiply32(d []uint8, r16, g16, b16, a16 uint32) {
+	switch a16 {
+	case 0xffff:
+		d[0] = uint8(r16 >> 8)
+		d[1] = uint8(g16 >> 8)
+		d[2] = uint8(b16 >> 8)
+		d[3] = 0xff
+	case 0:
+		d[0] = 0
+		d[1] = 0
+		d[2] = 0
+		d[3] = 0
+	default:
+		d[0] = uint8(((r16 * 0xffff) / a16) >> 8)
+		d[1] = uint8(((g16 * 0xffff) / a16) >> 8)
+		d[2] = uint8(((b16 * 0xffff) / a16) >> 8)
+		d[3] = uint8(a16 >> 8)
+	}
+}
+
+func scanNRGBA(img *image.NRGBA) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		size := (x2 - x1) * 4
 		j := 0
 		i := y1*img.Stride + x1*4
@@ -51,8 +150,11 @@ func (s *scanner) scan(x1, y1, x2, y2 int, dst []uint8) {
 				i += img.Stride
 			}
 		}
+	}
+}
 
-	case *image.NRGBA64:
+func scanNRGBA64(img *image.NRGBA64) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
 		for y := y1; y < y2; y++ {
 			i := y*img.Stride + x1*8
@@ -67,75 +169,39 @@ func (s *scanner) scan(x1, y1, x2, y2 int, dst []uint8) {
 				i += 8
 			}
 		}
+	}
+}
 
-	case *image.RGBA:
+func scanRGBA(img *image.RGBA) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
 		for y := y1; y < y2; y++ {
 			i := y*img.Stride + x1*4
 			for x := x1; x < x2; x++ {
-				d := dst[j : j+4 : j+4]
-				a := img.Pix[i+3]
-				switch a {
-				case 0:
-					d[0] = 0
-					d[1] = 0
-					d[2] = 0
-					d[3] = a
-				case 0xff:
-					s := img.Pix[i : i+4 : i+4]
-					d[0] = s[0]
-					d[1] = s[1]
-					d[2] = s[2]
-					d[3] = a
-				default:
-					s := img.Pix[i : i+4 : i+4]
-					r16 := uint16(s[0])
-					g16 := uint16(s[1])
-					b16 := uint16(s[2])
-					a16 := uint16(a)
-					d[0] = uint8(r16 * 0xff / a16)
-					d[1] = uint8(g16 * 0xff / a16)
-					d[2] = uint8(b16 * 0xff / a16)
-					d[3] = a
-				}
+				unpremultiply8(dst[j:j+4:j+4], img.Pix[i:i+4:i+4])
 				j += 4
 				i += 4
 			}
 		}
+	}
+}
 
-	case *image.RGBA64:
+func scanRGBA64(img *image.RGBA64) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
 		for y := y1; y < y2; y++ {
 			i := y*img.Stride + x1*8
 			for x := x1; x < x2; x++ {
-				s := img.Pix[i : i+8 : i+8]
-				d := dst[j : j+4 : j+4]
-				a := s[6]
-				switch a {
-				case 0:
-					d[0] = 0
-					d[1] = 0
-					d[2] = 0
-				case 0xff:
-					d[0] = s[0]
-					d[1] = s[2]
-					d[2] = s[4]
-				default:
-					r32 := uint32(s[0])<<8 | uint32(s[1])
-					g32 := uint32(s[2])<<8 | uint32(s[3])
-					b32 := uint32(s[4])<<8 | uint32(s[5])
-					a32 := uint32(s[6])<<8 | uint32(s[7])
-					d[0] = uint8((r32 * 0xffff / a32) >> 8)
-					d[1] = uint8((g32 * 0xffff / a32) >> 8)
-					d[2] = uint8((b32 * 0xffff / a32) >> 8)
-				}
-				d[3] = a
+				unpremultiply16(dst[j:j+4:j+4], img.Pix[i:i+8:i+8])
 				j += 4
 				i += 8
 			}
 		}
+	}
+}
 
-	case *image.Gray:
+func scanGray(img *image.Gray) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
 		for y := y1; y < y2; y++ {
 			i := y*img.Stride + x1
@@ -150,8 +216,11 @@ func (s *scanner) scan(x1, y1, x2, y2 int, dst []uint8) {
 				i++
 			}
 		}
+	}
+}
 
-	case *image.Gray16:
+func scanGray16(img *image.Gray16) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
 		for y := y1; y < y2; y++ {
 			i := y*img.Stride + x1*2
@@ -166,8 +235,30 @@ func (s *scanner) scan(x1, y1, x2, y2 int, dst []uint8) {
 				i += 2
 			}
 		}
+	}
+}
 
-	case *image.YCbCr:
+func scanPaletted(img *image.Paletted, palette []color.NRGBA) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
+		j := 0
+		for y := y1; y < y2; y++ {
+			i := y*img.Stride + x1
+			for x := x1; x < x2; x++ {
+				c := palette[img.Pix[i]]
+				d := dst[j : j+4 : j+4]
+				d[0] = c.R
+				d[1] = c.G
+				d[2] = c.B
+				d[3] = c.A
+				j += 4
+				i++
+			}
+		}
+	}
+}
+
+func scanYCbCr(img *image.YCbCr) scanFunc {
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
 		x1 += img.Rect.Min.X
 		x2 += img.Rect.Min.X
@@ -233,51 +324,21 @@ func (s *scanner) scan(x1, y1, x2, y2 int, dst []uint8) {
 				j += 4
 			}
 		}
+	}
+}
 
-	case *image.Paletted:
+func scanGeneric(img image.Image) scanFunc {
+	b := img.Bounds()
+	return func(x1, y1, x2, y2 int, dst []uint8) {
 		j := 0
-		for y := y1; y < y2; y++ {
-			i := y*img.Stride + x1
-			for x := x1; x < x2; x++ {
-				c := s.palette[img.Pix[i]]
-				d := dst[j : j+4 : j+4]
-				d[0] = c.R
-				d[1] = c.G
-				d[2] = c.B
-				d[3] = c.A
-				j += 4
-				i++
-			}
-		}
-
-	default:
-		j := 0
-		b := s.image.Bounds()
 		x1 += b.Min.X
 		x2 += b.Min.X
 		y1 += b.Min.Y
 		y2 += b.Min.Y
 		for y := y1; y < y2; y++ {
 			for x := x1; x < x2; x++ {
-				r16, g16, b16, a16 := s.image.At(x, y).RGBA()
-				d := dst[j : j+4 : j+4]
-				switch a16 {
-				case 0xffff:
-					d[0] = uint8(r16 >> 8)
-					d[1] = uint8(g16 >> 8)
-					d[2] = uint8(b16 >> 8)
-					d[3] = 0xff
-				case 0:
-					d[0] = 0
-					d[1] = 0
-					d[2] = 0
-					d[3] = 0
-				default:
-					d[0] = uint8(((r16 * 0xffff) / a16) >> 8)
-					d[1] = uint8(((g16 * 0xffff) / a16) >> 8)
-					d[2] = uint8(((b16 * 0xffff) / a16) >> 8)
-					d[3] = uint8(a16 >> 8)
-				}
+				r16, g16, b16, a16 := img.At(x, y).RGBA()
+				unpremultiply32(dst[j:j+4:j+4], r16, g16, b16, a16)
 				j += 4
 			}
 		}
