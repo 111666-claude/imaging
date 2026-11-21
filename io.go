@@ -21,12 +21,37 @@ import (
 type fileSystem interface {
 	Create(string) (io.WriteCloser, error)
 	Open(string) (io.ReadCloser, error)
+
+	// The methods below are used by Save in safe replacement mode.
+	CreateTemp(dir, pattern string) (saveFile, error)
+	Rename(oldpath, newpath string) error
+	Remove(name string) error
+	Stat(name string) (os.FileInfo, error)
+}
+
+// saveFile is a temporary file used by Save in safe replacement mode.
+// It is an interface (rather than *os.File) so that tests can inject
+// failures at the write, chmod, sync, close and rename stages.
+type saveFile interface {
+	io.Writer
+	Name() string
+	Chmod(mode os.FileMode) error
+	Sync() error
+	Close() error
 }
 
 type localFS struct{}
 
 func (localFS) Create(name string) (io.WriteCloser, error) { return os.Create(name) }
 func (localFS) Open(name string) (io.ReadCloser, error)    { return os.Open(name) }
+
+func (localFS) CreateTemp(dir, pattern string) (saveFile, error) {
+	return ioutil.TempFile(dir, pattern)
+}
+
+func (localFS) Rename(oldpath, newpath string) error  { return os.Rename(oldpath, newpath) }
+func (localFS) Remove(name string) error              { return os.Remove(name) }
+func (localFS) Stat(name string) (os.FileInfo, error) { return os.Stat(name) }
 
 var fs fileSystem = localFS{}
 
@@ -138,6 +163,18 @@ func (f Format) String() string {
 // ErrUnsupportedFormat means the given image format is not supported.
 var ErrUnsupportedFormat = errors.New("imaging: unsupported image format")
 
+// ErrNilImage is returned by Encode and Save when the image is nil.
+var ErrNilImage = errors.New("imaging: nil image")
+
+// ErrEmptyImage is returned by Save in safe replacement mode when the image
+// has empty bounds (zero width or height), since replacing a published file
+// with an image no encoder can meaningfully represent is never intended.
+var ErrEmptyImage = errors.New("imaging: empty image")
+
+// errDestinationIsDir is returned by Save in safe replacement mode when the
+// destination path refers to an existing directory.
+var errDestinationIsDir = errors.New("destination is a directory")
+
 // FormatFromExtension parses image format from filename extension:
 // "jpg" (or "jpeg"), "png", "gif", "tif" (or "tiff") and "bmp" are supported.
 func FormatFromExtension(ext string) (Format, error) {
@@ -160,6 +197,12 @@ type encodeConfig struct {
 	gifQuantizer        draw.Quantizer
 	gifDrawer           draw.Drawer
 	pngCompressionLevel png.CompressionLevel
+
+	// Options used by the safe replacement mode of Save (see SafeReplace).
+	safeReplace bool
+	safeSync    bool
+	safeMode    os.FileMode
+	safeModeSet bool
 }
 
 var defaultEncodeConfig = encodeConfig{
@@ -168,6 +211,7 @@ var defaultEncodeConfig = encodeConfig{
 	gifQuantizer:        nil,
 	gifDrawer:           nil,
 	pngCompressionLevel: png.DefaultCompression,
+	safeSync:            true,
 }
 
 // EncodeOption sets an optional parameter for the Encode and Save functions.
@@ -213,13 +257,79 @@ func PNGCompressionLevel(level png.CompressionLevel) EncodeOption {
 	}
 }
 
+// SafeReplace returns an EncodeOption that switches Save to the safe
+// replacement mode. In this mode Save encodes the image to a temporary file
+// created in the same directory as filename and atomically renames it over
+// filename only after the encoding, the writes, the optional sync and the
+// close have all succeeded. If any of these steps fails, the destination file
+// is left untouched (its contents are preserved) and the temporary file is
+// removed. If the destination did not exist, it is not created at all.
+//
+// The encoding format is always determined from the extension of the final
+// filename, never from the temporary file name. If the destination already
+// exists, its permission bits are preserved; otherwise the new file gets mode
+// 0644. Both can be overridden with SafeReplaceFileMode.
+//
+// The default Save behavior (writing directly into the destination) is
+// unchanged; pass SafeReplace to opt in to the safe mode.
+//
+// On platforms where renaming over an existing file is not possible while
+// that file is open (notably Windows), Save returns the rename error, keeps
+// the old file bytes and removes the temporary file. Save never falls back to
+// deleting the destination before renaming, because that would break the
+// atomic replacement guarantee.
+//
+// SafeReplace is ignored by Encode.
+func SafeReplace() EncodeOption {
+	return func(c *encodeConfig) {
+		c.safeReplace = true
+	}
+}
+
+// SafeReplaceSync returns an EncodeOption that controls whether Save flushes
+// the temporary file to stable storage (File.Sync) before replacing the
+// destination in safe replacement mode. Enabling it reduces the chance that a
+// system crash leaves a renamed but incompletely written file. Default is true.
+//
+// The option is ignored unless SafeReplace is also specified.
+func SafeReplaceSync(enabled bool) EncodeOption {
+	return func(c *encodeConfig) {
+		c.safeSync = enabled
+	}
+}
+
+// SafeReplaceFileMode returns an EncodeOption that sets the permission bits of
+// the file created by Save in safe replacement mode. When it is not specified,
+// an existing destination keeps its permission bits and a new destination is
+// created with mode 0644. Unlike the mode passed to os.Create, this mode is
+// applied with File.Chmod, so it is not filtered by the process umask.
+//
+// The option enables the safe replacement mode and is ignored by Encode.
+func SafeReplaceFileMode(mode os.FileMode) EncodeOption {
+	return func(c *encodeConfig) {
+		c.safeReplace = true
+		c.safeMode = mode
+		c.safeModeSet = true
+	}
+}
+
 // Encode writes the image img to w in the specified format (JPEG, PNG, GIF, TIFF or BMP).
 func Encode(w io.Writer, img image.Image, format Format, opts ...EncodeOption) error {
+	if img == nil {
+		return ErrNilImage
+	}
+
 	cfg := defaultEncodeConfig
 	for _, option := range opts {
 		option(&cfg)
 	}
+	return encode(w, img, format, cfg)
+}
 
+// encode writes img to w using an already resolved configuration. The
+// encode options are consumed by the caller so that they are applied exactly
+// once per call.
+func encode(w io.Writer, img image.Image, format Format, cfg encodeConfig) error {
 	switch format {
 	case JPEG:
 		if nrgba, ok := img.(*image.NRGBA); ok && nrgba.Opaque() {
@@ -257,6 +367,16 @@ func Encode(w io.Writer, img image.Image, format Format, opts ...EncodeOption) e
 // The format is determined from the filename extension:
 // "jpg" (or "jpeg"), "png", "gif", "tif" (or "tiff") and "bmp" are supported.
 //
+// By default Save creates (or truncates) the destination file and writes the
+// encoded image directly to it. If the encoding fails, the destination may be
+// left truncated or partially written. Pass the SafeReplace option to write to
+// a temporary file in the destination directory and atomically rename it over
+// the destination only after a successful encode, so that a failure never
+// corrupts an existing file:
+//
+//	// Save the image as PNG, atomically replacing an existing file.
+//	err := imaging.Save(img, "out.png", imaging.SafeReplace())
+//
 // Examples:
 //
 //	// Save the image as PNG.
@@ -270,16 +390,126 @@ func Save(img image.Image, filename string, opts ...EncodeOption) (err error) {
 	if err != nil {
 		return err
 	}
+
+	cfg := defaultEncodeConfig
+	for _, option := range opts {
+		option(&cfg)
+	}
+	if img == nil {
+		return ErrNilImage
+	}
+	if cfg.safeReplace {
+		return saveSafe(img, f, filename, cfg)
+	}
+
 	file, err := fs.Create(filename)
 	if err != nil {
 		return err
 	}
-	err = Encode(file, img, f, opts...)
+	err = encode(file, img, f, cfg)
 	errc := file.Close()
 	if err == nil {
 		err = errc
 	}
 	return err
+}
+
+// SaveSafe saves the image to file using the safe replacement mode.
+// It is equivalent to calling Save with the SafeReplace option:
+//
+//	imaging.Save(img, filename, imaging.SafeReplace())
+//
+// The destination file is replaced atomically and is left unchanged if the
+// encoding or any of the write, sync, close or rename steps fails.
+func SaveSafe(img image.Image, filename string, opts ...EncodeOption) error {
+	all := make([]EncodeOption, 0, len(opts)+1)
+	all = append(all, opts...)
+	all = append(all, SafeReplace())
+	return Save(img, filename, all...)
+}
+
+// saveSafe implements the safe replacement mode of Save.
+func saveSafe(img image.Image, format Format, filename string, cfg encodeConfig) (err error) {
+	if img.Bounds().Empty() {
+		return ErrEmptyImage
+	}
+
+	dir, base := filepath.Split(filename)
+	if dir == "" {
+		dir = "."
+	}
+
+	// Reject the destination early if it is a directory: renaming over it
+	// cannot succeed, and doing so before encoding avoids the cost of
+	// producing an image that would have to be thrown away.
+	if info, statErr := fs.Stat(filename); statErr == nil && info.IsDir() {
+		return &os.PathError{Op: "save", Path: filename, Err: errDestinationIsDir}
+	}
+
+	mode := os.FileMode(0644)
+	if cfg.safeModeSet {
+		mode = cfg.safeMode
+	} else if info, statErr := fs.Stat(filename); statErr == nil {
+		// Preserve the permission bits of the file being replaced.
+		mode = info.Mode().Perm()
+	}
+
+	// The temporary file is created next to the destination so that the
+	// final rename stays within a single filesystem and can be atomic.
+	file, err := fs.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpname := file.Name()
+
+	// cleanup removes the temporary file. It is called after every failure
+	// path below, including panics caused by a misbehaving encoder.
+	defer func() {
+		if file != nil {
+			// Close may already have been called; ignore its error since
+			// the file is being discarded.
+			_ = file.Close()
+		}
+		if tmpname == "" {
+			return
+		}
+		// If the temporary file was never successfully written, the
+		// destination may be left untouched. A stray temporary file,
+		// however, would be visible to the editor, so its removal
+		// failure is reported whenever there is no more important error.
+		if cleanupErr := fs.Remove(tmpname); cleanupErr != nil && err == nil {
+			err = cleanupErr
+		}
+	}()
+
+	// The image is encoded directly into the temporary file. If the
+	// encoder or any of its writes fails, the partial temporary file is
+	// removed by the deferred cleanup and the destination is untouched.
+	if encErr := encode(file, img, format, cfg); encErr != nil {
+		return encErr
+	}
+	if chmodErr := file.Chmod(mode); chmodErr != nil {
+		return chmodErr
+	}
+	if cfg.safeSync {
+		if syncErr := file.Sync(); syncErr != nil {
+			return syncErr
+		}
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		return closeErr
+	}
+	file = nil
+
+	// Only a fully written, synced and closed file is moved over the
+	// destination. A failed rename leaves the old destination bytes intact.
+	if err = fs.Rename(tmpname, filename); err != nil {
+		return err
+	}
+
+	// The rename consumed the temporary name; there is nothing to remove.
+	tmpname = ""
+	return nil
 }
 
 // orientation is an EXIF flag that specifies the transformation

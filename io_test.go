@@ -35,6 +35,13 @@ func (badFS) Open(name string) (io.ReadCloser, error) {
 	return nil, errOpen
 }
 
+// The safe replacement mode is not exercised with badFS; these methods only
+// make badFS satisfy the extended fileSystem interface.
+func (badFS) CreateTemp(dir, pattern string) (saveFile, error) { return nil, errCreate }
+func (badFS) Rename(oldpath, newpath string) error             { return errCreate }
+func (badFS) Remove(name string) error                         { return errCreate }
+func (badFS) Stat(name string) (os.FileInfo, error)            { return nil, errCreate }
+
 type badFile struct {
 	io.Writer
 }

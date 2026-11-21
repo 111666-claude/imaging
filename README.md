@@ -129,6 +129,33 @@ Original image                     | Saturation = 30                            
 -----------------------------------|----------------------------------------------|---------------------------------------------
 ![srcImage](testdata/flowers_small.png) | ![dstImage](testdata/out_saturation_p30.png) | ![dstImage](testdata/out_saturation_m30.png)
 
+### Safe file replacement
+
+`imaging.Save` writes directly into the destination file. If encoding fails
+halfway through, an existing file is already truncated. When overwriting a
+file that matters (a published texture, a user's screenshot, etc.), use the
+safe replacement mode instead:
+
+```go
+// Equivalent:
+err := imaging.Save(dstImage, "texture.png", imaging.SafeReplace())
+err = imaging.SaveSafe(dstImage, "texture.png")
+
+// Control durability and permissions:
+err = imaging.SaveSafe(dstImage, "texture.png",
+	imaging.SafeReplaceSync(true),        // fsync before rename (default)
+	imaging.SafeReplaceFileMode(0644),    // default: keep existing mode, else 0644
+)
+```
+
+The image is encoded into a temporary file created in the destination
+directory, synced (optionally), closed, and only then atomically renamed over
+the destination. The format is always taken from the final filename. If any
+step fails, the old file is left untouched and the temporary file is removed;
+if the destination did not exist, no file is created at all. On platforms
+where replacing an open file is not possible (e.g. Windows), the rename error
+is returned and the old file is preserved.
+
 ## FAQ
 
 ### Incorrect image orientation after processing (e.g. an image appears rotated after resizing)
