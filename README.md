@@ -64,6 +64,38 @@ Filter                    | Resize result
 `imaging.CatmullRom`      | ![dstImage](testdata/out_resize_catrom.png)
 `imaging.Lanczos`         | ![dstImage](testdata/out_resize_lanczos.png)
 
+**Memory-budgeted two-axis resize**
+
+When both dimensions change, a resize is computed as a horizontal pass followed
+by a vertical pass. By default the whole horizontally resized intermediate
+image is materialized; for a very large source and a small output (e.g.
+exporting a huge map preview), that temporary image can exhaust memory even
+though the final output is small.
+
+`SetResizeBufferBytes` caps the intermediate buffer: the horizontal pass is
+then computed in reusable bands, each holding only the source rows reached by
+the vertical resampling kernel. Output pixels are bit-identical to the
+unbounded resize — only the size and lifetime of the temporary buffer change.
+
+```go
+// Cap the horizontal intermediate at 64 MiB for all subsequent Resize calls.
+// A value <= 0 (the default) removes the limit.
+imaging.SetResizeBufferBytes(64 << 20)
+dst := imaging.Resize(srcImage, 1920, 1080, imaging.Lanczos)
+```
+
+`ResizeWithBuffer` takes an explicit per-call budget and returns
+`ErrResizeBufferTooSmall` when the budget cannot hold even a single output
+row's kernel footprint, or `ErrResizeDimensionsTooLarge` when dimensions or
+the kernel would overflow integer arithmetic. It never silently falls back to
+a full-size temporary image:
+
+```go
+dst, err := imaging.ResizeWithBuffer(srcImage, 1920, 1080, imaging.Lanczos, 64<<20)
+if errors.Is(err, imaging.ErrResizeBufferTooSmall) {
+    // The kernel is too wide for this budget: raise it or resize in steps.
+}
+```
 
 ### Gaussian Blur
 

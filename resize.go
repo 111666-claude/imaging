@@ -1,8 +1,10 @@
 package imaging
 
 import (
+	"errors"
 	"image"
 	"math"
+	"sync/atomic"
 )
 
 type indexWeight struct {
@@ -10,7 +12,45 @@ type indexWeight struct {
 	weight float64
 }
 
-func precomputeWeights(dstSize, srcSize int, filter ResampleFilter) [][]indexWeight {
+// Sentinel errors returned by the budgeted resize API.
+var (
+	// ErrResizeBufferTooSmall is returned when the configured intermediate
+	// buffer budget cannot hold the horizontal resize result for even a single
+	// output row. The minimum required footprint is driven by the vertical
+	// resampling kernel width, so an extremely wide kernel or a budget smaller
+	// than one destination row (dstWidth*4 bytes) triggers this error.
+	ErrResizeBufferTooSmall = errors.New("imaging: resize buffer budget is too small for the resampling kernel width")
+
+	// ErrResizeDimensionsTooLarge is returned when an image dimension, a
+	// resampling kernel support radius or the product of dimensions would
+	// overflow the platform integer type while allocating buffers.
+	ErrResizeDimensionsTooLarge = errors.New("imaging: resize dimensions or filter kernel are too large: integer overflow")
+)
+
+// resizeBufferBytes stores the package-wide budget for the horizontal
+// intermediate buffer used by Resize. A value of 0 means unlimited.
+var resizeBufferBytes int64
+
+// SetResizeBufferBytes sets the package-wide budget in bytes for the
+// intermediate horizontal resize buffer used by Resize when both width and
+// height change. The two-axis resize is split into horizontal and vertical
+// passes. Instead of materializing the full horizontally resized image, the
+// implementation now processes it in horizontal bands: each band holds only
+// the source rows required by the vertical resampling kernel, reusing one
+// buffer of at most bufferBytes.
+//
+// A value of 0 or less clears the limit and restores the default behavior of
+// allocating the full intermediate image.
+//
+// If an in-flight Resize cannot fit even a single output row's kernel
+// footprint into the budget, Resize panics with ErrResizeBufferTooSmall rather
+// than silently falling back to a full-size temporary image. Use
+// ResizeWithBuffer to handle that case as a returned error.
+func SetResizeBufferBytes(bufferBytes int64) {
+	atomic.StoreInt64(&resizeBufferBytes, bufferBytes)
+}
+
+func precomputeWeights(dstSize, srcSize int, filter ResampleFilter) ([][]indexWeight, error) {
 	du := float64(srcSize) / float64(dstSize)
 	scale := du
 	if scale < 1.0 {
@@ -18,8 +58,20 @@ func precomputeWeights(dstSize, srcSize int, filter ResampleFilter) [][]indexWei
 	}
 	ru := math.Ceil(scale * filter.Support)
 
+	// Guard the integer conversions and the tmp capacity below against
+	// extremely wide (or malformed) filter kernels. The effective sampling
+	// range is later clamped to [0, srcSize-1] anyway, so an oversized radius
+	// only matters here for allocation safety.
+	if ru < 0 || ru > float64(math.MaxInt)/4 {
+		return nil, ErrResizeDimensionsTooLarge
+	}
+	cap64 := int64(dstSize) * int64(ru+2) * 2
+	if cap64 > int64(math.MaxInt) {
+		return nil, ErrResizeDimensionsTooLarge
+	}
+
 	out := make([][]indexWeight, dstSize)
-	tmp := make([]indexWeight, 0, dstSize*int(ru+2)*2)
+	tmp := make([]indexWeight, 0, int(cap64))
 
 	for v := 0; v < dstSize; v++ {
 		fu := (float64(v)+0.5)*du - 0.5
@@ -51,30 +103,58 @@ func precomputeWeights(dstSize, srcSize int, filter ResampleFilter) [][]indexWei
 		tmp = tmp[len(tmp):]
 	}
 
-	return out
+	return out, nil
 }
 
 // Resize resizes the image to the specified width and height using the specified resampling
 // filter and returns the transformed image. If one of width or height is 0, the image aspect
 // ratio is preserved.
 //
+// When both dimensions change, the horizontal pass is computed in reusable
+// bands bounded by the budget configured with SetResizeBufferBytes (default:
+// unlimited). If that budget is too small for the resampling kernel width,
+// Resize panics with ErrResizeBufferTooSmall; callers that need to handle this
+// as an error should use ResizeWithBuffer.
+//
 // Example:
 //
 //	dstImage := imaging.Resize(srcImage, 800, 600, imaging.Lanczos)
-//
 func Resize(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA {
+	dst, err := ResizeWithBuffer(img, width, height, filter, atomic.LoadInt64(&resizeBufferBytes))
+	if err != nil {
+		panic(err)
+	}
+	return dst
+}
+
+// ResizeWithBuffer works like Resize but limits the intermediate horizontal
+// resize buffer to at most bufferBytes. A value of 0 or less means unlimited.
+// The output is always a regular *image.NRGBA image identical to the one
+// Resize would produce.
+//
+// The buffer is reused across horizontal bands: each band contains the
+// horizontally resized source rows that the vertical resampling weights of
+// the band's output rows reach. Boundary weights and alpha handling are
+// computed with the same per-pixel arithmetic as an unbounded Resize, so
+// results are bit-identical.
+//
+// It returns ErrResizeBufferTooSmall if no band can be formed within the
+// budget (including the case of an extremely wide resampling kernel) and
+// ErrResizeDimensionsTooLarge if the dimensions or kernel would overflow
+// integer arithmetic while allocating buffers.
+func ResizeWithBuffer(img image.Image, width, height int, filter ResampleFilter, bufferBytes int64) (*image.NRGBA, error) {
 	dstW, dstH := width, height
 	if dstW < 0 || dstH < 0 {
-		return &image.NRGBA{}
+		return &image.NRGBA{}, nil
 	}
 	if dstW == 0 && dstH == 0 {
-		return &image.NRGBA{}
+		return &image.NRGBA{}, nil
 	}
 
 	srcW := img.Bounds().Dx()
 	srcH := img.Bounds().Dy()
 	if srcW <= 0 || srcH <= 0 {
-		return &image.NRGBA{}
+		return &image.NRGBA{}, nil
 	}
 
 	// If new width or height is 0 then preserve aspect ratio, minimum 1px.
@@ -88,28 +168,255 @@ func Resize(img image.Image, width, height int, filter ResampleFilter) *image.NR
 	}
 
 	if srcW == dstW && srcH == dstH {
-		return Clone(img)
+		return Clone(img), nil
 	}
 
 	if filter.Support <= 0 {
 		// Nearest-neighbor special case.
-		return resizeNearest(img, dstW, dstH)
+		return resizeNearest(img, dstW, dstH), nil
+	}
+
+	// All size math below is checked in int64 before touching int-sized
+	// allocations, so dimension multiplications cannot wrap on 32-bit ports.
+	// The *4 factors account for the 4 bytes per NRGBA pixel; any product that
+	// would not fit in an int slice length is rejected explicitly instead of
+	// panicking inside make.
+	if int64(srcW)*4 > int64(math.MaxInt) ||
+		int64(dstW)*4 > int64(math.MaxInt) ||
+		int64(srcW)*int64(srcH) > int64(math.MaxInt)/4 ||
+		int64(dstW)*int64(srcH) > int64(math.MaxInt)/4 ||
+		int64(dstW)*int64(dstH) > int64(math.MaxInt)/4 {
+		return nil, ErrResizeDimensionsTooLarge
 	}
 
 	if srcW != dstW && srcH != dstH {
-		return resizeVertical(resizeHorizontal(img, dstW, filter), dstH, filter)
+		return resizeTwoPass(img, dstW, dstH, filter, bufferBytes)
 	}
 	if srcW != dstW {
 		return resizeHorizontal(img, dstW, filter)
 	}
 	return resizeVertical(img, dstH, filter)
-
 }
 
-func resizeHorizontal(img image.Image, width int, filter ResampleFilter) *image.NRGBA {
+// resizeBand describes one horizontal band: output rows [y0, y1) are produced
+// from the horizontally resized source rows [src0, src1).
+type resizeBand struct {
+	y0, y1     int
+	src0, src1 int
+}
+
+// planResizeBands splits the destination rows into bands whose horizontal
+// scratch footprint (rows*rowBytes) fits into bufferBytes. Each band spans the
+// union of the vertical kernel footprints of its output rows. Rows with empty
+// weights contribute no footprint. An unlimited budget (<=0) yields a single
+// full-height band.
+func planResizeBands(weights [][]indexWeight, rowBytes int64, bufferBytes int64) ([]resizeBand, int, error) {
+	if rowBytes <= 0 || rowBytes > int64(math.MaxInt) {
+		return nil, 0, ErrResizeDimensionsTooLarge
+	}
+	budget := bufferBytes
+	if budget <= 0 {
+		budget = math.MaxInt64
+	}
+
+	need := func(rows int64) (int64, error) {
+		if rows < 0 || rows > math.MaxInt64/rowBytes {
+			return 0, ErrResizeDimensionsTooLarge
+		}
+		n := rows * rowBytes
+		if n > int64(math.MaxInt) {
+			return 0, ErrResizeDimensionsTooLarge
+		}
+		return n, nil
+	}
+
+	var bands []resizeBand
+	maxScratchRows := 0
+	y := 0
+	for y < len(weights) {
+		bandY0 := y
+		lo, hi := math.MaxInt, -1
+
+		// extend returns (false, nil) when adding row y would exceed the
+		// budget and (false, err) on an arithmetic overflow.
+		extend := func(row int) (bool, error) {
+			nlo, nhi := lo, hi
+			if len(weights[row]) > 0 {
+				if rlo := weights[row][0].index; rlo < nlo {
+					nlo = rlo
+				}
+				if rhi := weights[row][len(weights[row])-1].index; rhi > nhi {
+					nhi = rhi
+				}
+			}
+			var rows int64
+			if nhi >= 0 {
+				rows = int64(nhi - nlo + 1)
+			}
+			n, err := need(rows)
+			if err != nil {
+				return false, err
+			}
+			if n > budget {
+				return false, nil
+			}
+			lo, hi = nlo, nhi
+			return true, nil
+		}
+
+		ok, err := extend(y)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !ok {
+			// Even a single output row does not fit: there is no valid
+			// smaller band, so never fall back to a full-size buffer.
+			return nil, 0, ErrResizeBufferTooSmall
+		}
+		y++
+		for y < len(weights) {
+			ok, err := extend(y)
+			if err != nil {
+				return nil, 0, err
+			}
+			if !ok {
+				break
+			}
+			y++
+		}
+
+		band := resizeBand{y0: bandY0, y1: y}
+		if hi >= 0 {
+			band.src0, band.src1 = lo, hi+1
+			if rows := hi - lo + 1; rows > maxScratchRows {
+				maxScratchRows = rows
+			}
+		}
+		bands = append(bands, band)
+	}
+	return bands, maxScratchRows, nil
+}
+
+// resizeTwoPass resizes both axes by banding the horizontal pass. The
+// arithmetic of every output pixel is the same as in the unbounded
+// resizeVertical(resizeHorizontal(...)) composition; only the lifetime and
+// size of the intermediate buffer change.
+func resizeTwoPass(img image.Image, dstW, dstH int, filter ResampleFilter, bufferBytes int64) (*image.NRGBA, error) {
+	src := newScanner(img)
+
+	hWeights, err := precomputeWeights(dstW, src.w, filter)
+	if err != nil {
+		return nil, err
+	}
+	vWeights, err := precomputeWeights(dstH, src.h, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	bands, scratchRows, err := planResizeBands(vWeights, int64(dstW)*4, bufferBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	dst := image.NewNRGBA(image.Rect(0, 0, dstW, dstH))
+	if scratchRows == 0 {
+		// Every vertical weight set is empty, so all outputs stay zero.
+		return dst, nil
+	}
+	// One buffer for the largest band, reused by every subsequent band.
+	scratch := make([]uint8, scratchRows*dstW*4)
+
+	for _, band := range bands {
+		if band.src1 <= band.src0 {
+			// Empty footprint: the corresponding destination rows are zero
+			// and were never written.
+			continue
+		}
+		bandScratch := scratch[:(band.src1-band.src0)*dstW*4]
+		resizeHorizontalRange(src, hWeights, dstW, band.src0, band.src1, bandScratch)
+		resizeVerticalRange(bandScratch, dstW*4, band.src0, band.y0, band.y1, vWeights, dst)
+	}
+	return dst, nil
+}
+
+// resizeHorizontalRange horizontally resizes source rows [yStart, yStop) into
+// scratch, whose row 0 corresponds to source row yStart. The accumulation
+// order and rounding match resizeHorizontal exactly.
+func resizeHorizontalRange(src *scanner, weights [][]indexWeight, width, yStart, yStop int, scratch []uint8) {
+	parallel(yStart, yStop, func(ys <-chan int) {
+		scanLine := make([]uint8, src.w*4)
+		for y := range ys {
+			src.scan(0, y, src.w, y+1, scanLine)
+			j0 := (y - yStart) * width * 4
+			for x := range weights {
+				var r, g, b, a float64
+				for _, w := range weights[x] {
+					i := w.index * 4
+					s := scanLine[i : i+4 : i+4]
+					aw := float64(s[3]) * w.weight
+					r += float64(s[0]) * aw
+					g += float64(s[1]) * aw
+					b += float64(s[2]) * aw
+					a += aw
+				}
+				j := j0 + x*4
+				d := scratch[j : j+4 : j+4]
+				if a == 0 {
+					// Explicit zero: scratch is reused across bands and must
+					// not retain stale pixels for fully transparent samples.
+					d[0], d[1], d[2], d[3] = 0, 0, 0, 0
+					continue
+				}
+				aInv := 1 / a
+				d[0] = clamp(r * aInv)
+				d[1] = clamp(g * aInv)
+				d[2] = clamp(b * aInv)
+				d[3] = clamp(a)
+			}
+		}
+	})
+}
+
+// resizeVerticalRange vertically resizes the band in scratch into dst output
+// rows [yStart, yStop). scratch row 0 corresponds to source row
+// bandSrcStart. The accumulation order and rounding match resizeVertical
+// exactly; only the memory layout of the intermediate image differs.
+func resizeVerticalRange(scratch []uint8, stride, bandSrcStart, yStart, yStop int, weights [][]indexWeight, dst *image.NRGBA) {
+	parallel(0, stride/4, func(xs <-chan int) {
+		for x := range xs {
+			xo := x * 4
+			for y := yStart; y < yStop; y++ {
+				var r, g, b, a float64
+				for _, w := range weights[y] {
+					i := (w.index-bandSrcStart)*stride + xo
+					s := scratch[i : i+4 : i+4]
+					aw := float64(s[3]) * w.weight
+					r += float64(s[0]) * aw
+					g += float64(s[1]) * aw
+					b += float64(s[2]) * aw
+					a += aw
+				}
+				if a != 0 {
+					aInv := 1 / a
+					j := y*dst.Stride + xo
+					d := dst.Pix[j : j+4 : j+4]
+					d[0] = clamp(r * aInv)
+					d[1] = clamp(g * aInv)
+					d[2] = clamp(b * aInv)
+					d[3] = clamp(a)
+				}
+			}
+		}
+	})
+}
+
+func resizeHorizontal(img image.Image, width int, filter ResampleFilter) (*image.NRGBA, error) {
 	src := newScanner(img)
 	dst := image.NewNRGBA(image.Rect(0, 0, width, src.h))
-	weights := precomputeWeights(width, src.w, filter)
+	weights, err := precomputeWeights(width, src.w, filter)
+	if err != nil {
+		return nil, err
+	}
 	parallel(0, src.h, func(ys <-chan int) {
 		scanLine := make([]uint8, src.w*4)
 		for y := range ys {
@@ -138,13 +445,16 @@ func resizeHorizontal(img image.Image, width int, filter ResampleFilter) *image.
 			}
 		}
 	})
-	return dst
+	return dst, nil
 }
 
-func resizeVertical(img image.Image, height int, filter ResampleFilter) *image.NRGBA {
+func resizeVertical(img image.Image, height int, filter ResampleFilter) (*image.NRGBA, error) {
 	src := newScanner(img)
 	dst := image.NewNRGBA(image.Rect(0, 0, src.w, height))
-	weights := precomputeWeights(height, src.h, filter)
+	weights, err := precomputeWeights(height, src.h, filter)
+	if err != nil {
+		return nil, err
+	}
 	parallel(0, src.w, func(xs <-chan int) {
 		scanLine := make([]uint8, src.h*4)
 		for x := range xs {
@@ -172,7 +482,7 @@ func resizeVertical(img image.Image, height int, filter ResampleFilter) *image.N
 			}
 		}
 	})
-	return dst
+	return dst, nil
 }
 
 // resizeNearest is a fast nearest-neighbor resize, no filtering.
@@ -220,7 +530,6 @@ func resizeNearest(img image.Image, width, height int) *image.NRGBA {
 // Example:
 //
 //	dstImage := imaging.Fit(srcImage, 800, 600, imaging.Lanczos)
-//
 func Fit(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA {
 	maxW, maxH := width, height
 
@@ -261,7 +570,6 @@ func Fit(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA
 // Example:
 //
 //	dstImage := imaging.Fill(srcImage, 800, 600, imaging.Center, imaging.Lanczos)
-//
 func Fill(img image.Image, width, height int, anchor Anchor, filter ResampleFilter) *image.NRGBA {
 	dstW, dstH := width, height
 
@@ -340,7 +648,6 @@ func resizeAndCrop(img image.Image, width, height int, anchor Anchor, filter Res
 // Example:
 //
 //	dstImage := imaging.Thumbnail(srcImage, 100, 100, imaging.Lanczos)
-//
 func Thumbnail(img image.Image, width, height int, filter ResampleFilter) *image.NRGBA {
 	return Fill(img, width, height, Center, filter)
 }
@@ -367,7 +674,6 @@ func Thumbnail(img image.Image, width, height int, filter ResampleFilter) *image
 //
 //	- NearestNeighbor
 //		Fastest resampling filter, no antialiasing.
-//
 type ResampleFilter struct {
 	Support float64
 	Kernel  func(float64) float64
