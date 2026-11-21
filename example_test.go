@@ -1,6 +1,7 @@
 package imaging_test
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"log"
@@ -55,4 +56,36 @@ func Example() {
 	if err != nil {
 		log.Fatalf("failed to save image: %v", err)
 	}
+}
+
+func ExampleSharpness() {
+	// Build a 64x32 image with a sharp black/white edge on the left half and
+	// a flat solid fill on the right half.
+	src := imaging.New(64, 32, color.NRGBA{128, 128, 128, 255})
+	for x := 0; x < 32; x++ {
+		c := color.NRGBA{0, 0, 0, 255}
+		if x >= 16 {
+			c = color.NRGBA{255, 255, 255, 255}
+		}
+		col := imaging.New(1, 32, c)
+		src = imaging.Paste(src, col, image.Pt(x, 0))
+	}
+
+	// Analyze local sharpness on a non-overlapping 32px grid. Window
+	// rectangles come back in the original image coordinates.
+	m, err := imaging.Sharpness(src, &imaging.SharpnessOptions{
+		WindowSize:     32,
+		Step:           32,
+		NoiseThreshold: 4,
+	})
+	if err != nil {
+		log.Fatalf("sharpness analysis failed: %v", err)
+	}
+
+	for _, r := range m.Regions {
+		fmt.Printf("%v score=%.2f coverage=%.2f\n", r.Rect, r.Score, r.Coverage)
+	}
+	// Output:
+	// (0,0)-(32,32) score=0.08 coverage=1.00
+	// (32,0)-(64,32) score=0.00 coverage=1.00
 }
