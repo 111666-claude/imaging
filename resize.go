@@ -108,8 +108,14 @@ func Resize(img image.Image, width, height int, filter ResampleFilter) *image.NR
 
 func resizeHorizontal(img image.Image, width int, filter ResampleFilter) *image.NRGBA {
 	src := newScanner(img)
+	return resizeHorizontalWithWeights(src, width, precomputeWeights(width, src.w, filter))
+}
+
+// resizeHorizontalWithWeights resizes the scanned image horizontally using the
+// given precomputed weights. The weights slice is read-only and may be shared
+// by concurrent calls.
+func resizeHorizontalWithWeights(src *scanner, width int, weights [][]indexWeight) *image.NRGBA {
 	dst := image.NewNRGBA(image.Rect(0, 0, width, src.h))
-	weights := precomputeWeights(width, src.w, filter)
 	parallel(0, src.h, func(ys <-chan int) {
 		scanLine := make([]uint8, src.w*4)
 		for y := range ys {
@@ -143,8 +149,14 @@ func resizeHorizontal(img image.Image, width int, filter ResampleFilter) *image.
 
 func resizeVertical(img image.Image, height int, filter ResampleFilter) *image.NRGBA {
 	src := newScanner(img)
+	return resizeVerticalWithWeights(src, height, precomputeWeights(height, src.h, filter))
+}
+
+// resizeVerticalWithWeights resizes the scanned image vertically using the
+// given precomputed weights. The weights slice is read-only and may be shared
+// by concurrent calls.
+func resizeVerticalWithWeights(src *scanner, height int, weights [][]indexWeight) *image.NRGBA {
 	dst := image.NewNRGBA(image.Rect(0, 0, src.w, height))
-	weights := precomputeWeights(height, src.h, filter)
 	parallel(0, src.w, func(xs <-chan int) {
 		scanLine := make([]uint8, src.h*4)
 		for x := range xs {

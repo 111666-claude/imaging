@@ -36,6 +36,18 @@ dstImageFit := imaging.Fit(srcImage, 800, 600, imaging.Lanczos)
 
 // Resize and crop the srcImage to fill the 100x100px area.
 dstImageFill := imaging.Fill(srcImage, 100, 100, imaging.Center, imaging.Lanczos)
+
+// Precompute the resampling weights once and reuse them to resize many
+// images of the same size (e.g. a batch of avatars). A plan is safe for
+// concurrent use and produces results identical to Resize.
+plan := imaging.NewResizePlan(600, 400, 100, 100, imaging.Lanczos)
+for _, src := range batch {
+	thumbnails = append(thumbnails, plan.Apply(src))
+}
+
+// Optionally share plans through a bounded cache with LRU eviction.
+cache := imaging.NewResizePlanCache(16)
+plan = cache.Get(600, 400, 100, 100, imaging.Lanczos)
 ```
 
 Imaging supports image resizing using various resampling filters. The most notable ones:
